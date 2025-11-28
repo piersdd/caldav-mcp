@@ -1,34 +1,12 @@
 """Pytest configuration for MCP CalDAV tests."""
 
-import os
 from contextlib import contextmanager
-from typing import Generator
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from mcp_caldav.client import CalDAVClient
 from mcp_caldav.server import AppContext
-
-
-@contextmanager
-def env_vars(new_env: dict[str, str | None]) -> Generator[None, None, None]:
-    """Context manager to temporarily set environment variables."""
-    old_values = {k: os.getenv(k) for k in new_env.keys()}
-
-    for k, v in new_env.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
-    try:
-        yield
-    finally:
-        for k, v in old_values.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
 
 
 @pytest.fixture
@@ -40,7 +18,11 @@ def mock_caldav_client():
 
     # Configure common methods
     mock_client.list_calendars.return_value = [
-        {"index": 0, "name": "Test Calendar", "url": "https://caldav.yandex.ru/calendars/test"}
+        {
+            "index": 0,
+            "name": "Test Calendar",
+            "url": "https://caldav.yandex.ru/calendars/test",
+        }
     ]
 
     mock_client.create_event.return_value = {
@@ -96,5 +78,3 @@ def mock_request_context(app_context):
         yield
     finally:
         request_ctx.reset(token)
-
-

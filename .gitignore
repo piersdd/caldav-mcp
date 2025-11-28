@@ -36,6 +36,7 @@ env/
 # Environment variables
 .env
 .env.local
+.env.e2e
 
 # Testing
 .pytest_cache/
@@ -55,4 +56,3 @@ Thumbs.db
 # Note: uv.lock is typically committed to version control for reproducible builds
 # Uncomment the line below if you don't want to commit it
 # uv.lock
-

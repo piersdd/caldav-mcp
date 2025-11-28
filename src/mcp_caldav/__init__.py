@@ -94,8 +94,7 @@ def main(
     asyncio.run(server.run_server(transport=transport, port=port))
 
 
-__all__ = ["main", "server", "__version__"]
+__all__ = ["__version__", "main", "server"]
 
 if __name__ == "__main__":
     main()
-

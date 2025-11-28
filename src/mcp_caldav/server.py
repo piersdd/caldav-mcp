@@ -29,13 +29,15 @@ def get_caldav_config() -> dict[str, str | None]:
     """Get CalDAV configuration from environment variables."""
     return {
         "url": os.getenv("CALDAV_URL"),  # No default - must be configured
-        "username": os.getenv("CALDAV_USERNAME") or os.getenv("YANDEX_USERNAME"),  # Backward compatibility
-        "password": os.getenv("CALDAV_PASSWORD") or os.getenv("YANDEX_PASSWORD"),  # Backward compatibility
+        "username": os.getenv("CALDAV_USERNAME")
+        or os.getenv("YANDEX_USERNAME"),  # Backward compatibility
+        "password": os.getenv("CALDAV_PASSWORD")
+        or os.getenv("YANDEX_PASSWORD"),  # Backward compatibility
     }
 
 
 @asynccontextmanager
-async def server_lifespan(server: Server) -> AsyncIterator[AppContext]:
+async def server_lifespan(server: Server) -> AsyncIterator[AppContext]:  # noqa: ARG001
     """Initialize and clean up application resources."""
     config = get_caldav_config()
 
@@ -152,11 +154,152 @@ async def list_tools() -> list[Tool]:
                     },
                     "attendees": {
                         "type": "array",
-                        "description": "List of attendee email addresses",
+                        "description": "List of attendee email addresses (strings) or objects with 'email' and 'status' (ACCEPTED/DECLINED/TENTATIVE/NEEDS-ACTION)",
+                        "items": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "email": {"type": "string"},
+                                        "status": {
+                                            "type": "string",
+                                            "enum": [
+                                                "ACCEPTED",
+                                                "DECLINED",
+                                                "TENTATIVE",
+                                                "NEEDS-ACTION",
+                                            ],
+                                        },
+                                    },
+                                    "required": ["email"],
+                                },
+                            ]
+                        },
+                    },
+                    "categories": {
+                        "type": "array",
+                        "description": "List of category/tag strings",
                         "items": {"type": "string"},
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "description": "Priority 0-9 (0 = highest, 9 = lowest)",
+                        "minimum": 0,
+                        "maximum": 9,
+                    },
+                    "recurrence": {
+                        "type": "object",
+                        "description": "Recurrence rule for repeating events",
+                        "properties": {
+                            "frequency": {
+                                "type": "string",
+                                "enum": ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"],
+                                "description": "How often the event repeats",
+                            },
+                            "interval": {
+                                "type": "integer",
+                                "description": "Interval between occurrences (default: 1)",
+                                "default": 1,
+                            },
+                            "count": {
+                                "type": "integer",
+                                "description": "Number of occurrences",
+                            },
+                            "until": {
+                                "type": "string",
+                                "description": "End date in ISO format",
+                            },
+                            "byday": {
+                                "type": "string",
+                                "description": "Days of week (e.g., 'MO,WE,FR' for Monday, Wednesday, Friday)",
+                            },
+                            "bymonthday": {
+                                "type": "integer",
+                                "description": "Day of month (1-31)",
+                            },
+                            "bymonth": {
+                                "type": "integer",
+                                "description": "Month (1-12)",
+                            },
+                        },
+                        "required": ["frequency"],
                     },
                 },
                 "required": ["title"],
+            },
+        ),
+        Tool(
+            name="caldav_get_event_by_uid",
+            description="Get a specific event by its UID",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Event UID",
+                    },
+                    "calendar_index": {
+                        "type": "integer",
+                        "description": "Index of the calendar (default: 0)",
+                        "default": 0,
+                    },
+                },
+                "required": ["uid"],
+            },
+        ),
+        Tool(
+            name="caldav_delete_event",
+            description="Delete an event by its UID",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Event UID to delete",
+                    },
+                    "calendar_index": {
+                        "type": "integer",
+                        "description": "Index of the calendar (default: 0)",
+                        "default": 0,
+                    },
+                },
+                "required": ["uid"],
+            },
+        ),
+        Tool(
+            name="caldav_search_events",
+            description="Search events by text, attendees, or location",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "calendar_index": {
+                        "type": "integer",
+                        "description": "Index of the calendar (default: 0)",
+                        "default": 0,
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query string",
+                    },
+                    "search_fields": {
+                        "type": "array",
+                        "description": "Fields to search in: 'title', 'description', 'location', 'attendees'. If not provided, searches in all fields",
+                        "items": {
+                            "type": "string",
+                            "enum": ["title", "description", "location", "attendees"],
+                        },
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date for search period in ISO format",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date for search period in ISO format",
+                    },
+                },
+                "required": ["start_date", "end_date"],
             },
         ),
         Tool(
@@ -232,16 +375,27 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     ctx = app.request_context.lifespan_context
 
     if not ctx or not ctx.client:
+        config = get_caldav_config()
+        missing = []
+        if not config.get("url"):
+            missing.append("CALDAV_URL")
+        if not config.get("username"):
+            missing.append("CALDAV_USERNAME")
+        if not config.get("password"):
+            missing.append("CALDAV_PASSWORD")
+
+        message = "CalDAV client not configured."
+        if missing:
+            message += f" Missing variables: {', '.join(missing)}."
+        else:
+            message += (
+                " Please configure CALDAV_URL, CALDAV_USERNAME, and CALDAV_PASSWORD."
+            )
+
         return [
             TextContent(
                 type="text",
-                text=json.dumps(
-                    {
-                        "error": "CalDAV client not configured. "
-                        "Set CALDAV_USERNAME and CALDAV_PASSWORD environment variables."
-                    },
-                    indent=2,
-                )
+                text=json.dumps({"error": message}, indent=2, ensure_ascii=False),
             )
         ]
 
@@ -265,14 +419,33 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             duration_hours = arguments.get("duration_hours", 1.0)
             reminders = arguments.get("reminders")
             attendees = arguments.get("attendees")
+            categories = arguments.get("categories")
+            priority = arguments.get("priority")
+            recurrence = arguments.get("recurrence")
 
             start_time = None
             if start_time_str:
-                start_time = datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+                start_time = datetime.fromisoformat(
+                    start_time_str.replace("Z", "+00:00")
+                )
 
             end_time = None
             if end_time_str:
                 end_time = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
+
+            # Parse recurrence until date if provided
+            if recurrence and recurrence.get("until"):
+                until_str = recurrence["until"]
+                try:
+                    recurrence["until"] = datetime.fromisoformat(
+                        until_str.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    # Try date format
+                    from contextlib import suppress
+
+                    with suppress(ValueError):
+                        recurrence["until"] = datetime.fromisoformat(until_str).date()
 
             result = ctx.client.create_event(
                 calendar_index=calendar_index,
@@ -284,6 +457,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 duration_hours=duration_hours,
                 reminders=reminders,
                 attendees=attendees,
+                categories=categories,
+                priority=priority,
+                recurrence=recurrence,
             )
 
             return [
@@ -301,8 +477,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
             start_date = None
             if start_date_str:
-                start_date = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
-
+                start_date = datetime.fromisoformat(
+                    start_date_str.replace("Z", "+00:00")
+                )
             end_date = None
             if end_date_str:
                 end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
@@ -346,13 +523,84 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
+        elif name == "caldav_get_event_by_uid":
+            uid = arguments.get("uid")
+            calendar_index = arguments.get("calendar_index", 0)
+
+            event = ctx.client.get_event_by_uid(uid=uid, calendar_index=calendar_index)
+
+            if event:
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(event, indent=2, ensure_ascii=False),
+                    )
+                ]
+            else:
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {"error": f"Event with UID {uid} not found"}, indent=2
+                        ),
+                    )
+                ]
+
+        elif name == "caldav_delete_event":
+            uid = arguments.get("uid")
+            calendar_index = arguments.get("calendar_index", 0)
+
+            result = ctx.client.delete_event(uid=uid, calendar_index=calendar_index)
+
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, ensure_ascii=False),
+                )
+            ]
+
+        elif name == "caldav_search_events":
+            calendar_index = arguments.get("calendar_index", 0)
+            query = arguments.get("query")
+            search_fields = arguments.get("search_fields")
+            start_date_str = arguments.get("start_date")
+            end_date_str = arguments.get("end_date")
+
+            if not start_date_str or not end_date_str:
+                raise ValueError(
+                    "caldav_search_events requires both start_date and end_date arguments."
+                )
+
+            start_date = None
+            if start_date_str:
+                start_date = datetime.fromisoformat(
+                    start_date_str.replace("Z", "+00:00")
+                )
+
+            end_date = None
+            if end_date_str:
+                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+
+            events = ctx.client.search_events(
+                calendar_index=calendar_index,
+                query=query,
+                search_fields=search_fields,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(events, indent=2, ensure_ascii=False),
+                )
+            ]
+
         else:
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps(
-                        {"error": f"Unknown tool: {name}"}, indent=2
-                    ),
+                    text=json.dumps({"error": f"Unknown tool: {name}"}, indent=2),
                 )
             ]
 
@@ -394,7 +642,7 @@ async def run_server(transport: str = "stdio", port: int = 8000) -> None:
 
         import uvicorn
 
-        config = uvicorn.Config(starlette_app, host="0.0.0.0", port=port)  # noqa: S104
+        config = uvicorn.Config(starlette_app, host="0.0.0.0", port=port)
         server = uvicorn.Server(config)
         await server.serve()
     else:
@@ -404,4 +652,3 @@ async def run_server(transport: str = "stdio", port: int = 8000) -> None:
             await app.run(
                 read_stream, write_stream, app.create_initialization_options()
             )
-
