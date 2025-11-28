@@ -52,7 +52,9 @@ uv run mcp-caldav --verbose
 ### 5. Запуск тестов
 
 ```bash
-uv run pytest tests/ -v
+make test          # Unit tests
+make test-e2e      # E2E tests (requires .env.e2e)
+make test-cov      # With coverage
 ```
 
 ## Полезные команды uv

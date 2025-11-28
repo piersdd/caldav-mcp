@@ -252,12 +252,15 @@ This project uses several tools to ensure code quality:
 uv sync --group dev
 
 # Run all checks
-uv run pre-commit run --all-files
+make check
 
 # Or individually
-uv run ruff check src/
-uv run ruff format src/
-uv run mypy src/mcp_caldav --ignore-missing-imports
+make lint
+make format
+make type-check
+
+# Or using pre-commit
+make pre-commit-run
 ```
 
 **Setup pre-commit hooks:**
@@ -273,31 +276,29 @@ See [CODE_QUALITY.md](CODE_QUALITY.md) for detailed information.
 **Unit tests (with mocks):**
 
 ```bash
-uv run pytest tests/ -m "not e2e"
+make test
+# or
+make test-unit
 ```
 
 **E2E tests (require real CalDAV server):**
 
 ```bash
-# Set environment variables first
-export CALDAV_URL="https://caldav.yandex.ru/"
-export CALDAV_USERNAME="your-username"
-export CALDAV_PASSWORD="your-app-password"
-
-# Run e2e tests
-uv run pytest tests/e2e/ -v -m e2e
+# Create .env.e2e file with your credentials, then:
+make test-e2e
 ```
 
 **All tests:**
 
 ```bash
-uv run pytest tests/
+make test
 ```
 
 **With coverage:**
 
 ```bash
-uv run pytest tests/ --cov=src/mcp_caldav --cov-report=html
+make test-cov        # Terminal report
+make coverage-html   # HTML report
 ```
 
 See [tests/e2e/README.md](tests/e2e/README.md) for more details on e2e tests.
@@ -318,6 +319,7 @@ caldav/
 │       ├── test_client_e2e.py
 │       └── conftest.py
 ├── pyproject.toml           # Project configuration
+├── Makefile                 # Development commands
 └── README.md                # This file
 ```
 

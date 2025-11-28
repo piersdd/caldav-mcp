@@ -31,7 +31,7 @@
 
 ### Configuration
 
-The `CalDAVClient` does not implement built-in retries. If you experience throttling, add manual `sleep` calls between operations or schedule writes during off-peak hours.
+The `CalDAVClient` does not implement automatic retry logic. If you experience throttling, add manual `sleep` calls between operations or schedule writes during off-peak hours.
 
 > **Testing status**: The project’s end-to-end tests run against Yandex Calendar. Other CalDAV providers follow the same protocol and should work, but they have not been exercised end-to-end yet.
 

@@ -121,22 +121,21 @@ uv run mcp-caldav --caldav-url "https://caldav.example.com/" \
 
 ## Запуск тестов
 
-Используя uv:
+Используя Makefile (рекомендуется):
 
 ```bash
-uv run pytest tests/
+make test          # Unit tests
+make test-e2e      # E2E tests (requires .env.e2e)
+make test-cov      # With coverage report
+make coverage-html  # HTML coverage report
 ```
 
-Или с покрытием:
+Или напрямую:
 
 ```bash
+uv run pytest tests/ -m "not e2e"  # Unit tests
+make test-e2e                       # E2E tests
 uv run pytest tests/ --cov=src/mcp_caldav --cov-report=html
-```
-
-Используя pip:
-
-```bash
-pytest tests/
 ```
 
 ## Примеры использования через MCP клиент

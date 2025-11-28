@@ -12,6 +12,8 @@ Type checking with strict rules to catch type errors before runtime.
 
 **Run manually**:
 ```bash
+make type-check
+# or
 uv run mypy src/mcp_caldav --ignore-missing-imports
 ```
 
@@ -30,13 +32,13 @@ Fast Python linter and formatter that replaces multiple tools (flake8, isort, bl
 **Run manually**:
 ```bash
 # Check for issues
-uv run ruff check src/
+make lint
 
-# Auto-fix issues
-uv run ruff check --fix src/
+# Auto-fix issues (lint with --fix)
+make lint  # ruff auto-fixes when possible
 
 # Format code
-uv run ruff format src/
+make format
 ```
 
 **Enabled rules**:
@@ -66,6 +68,8 @@ uv run pre-commit install
 **Run manually**:
 ```bash
 # Run on all files
+make pre-commit-run
+# or
 uv run pre-commit run --all-files
 
 # Run on staged files only
@@ -94,12 +98,12 @@ uv run pre-commit run
 2. **Manual checks** (optional):
    ```bash
    # Run all checks
-   uv run pre-commit run --all-files
+   make check
 
    # Or individually
-   uv run ruff check src/
-   uv run ruff format src/
-   uv run mypy src/mcp_caldav --ignore-missing-imports
+   make lint
+   make format
+   make type-check
    ```
 
 ### CI/CD Integration
@@ -184,3 +188,4 @@ This installs:
 - `mypy>=1.8.0`
 - `ruff>=0.4.0`
 - `pre-commit>=3.6.0`
+- `types-click>=7.1.0` (type stubs for click)

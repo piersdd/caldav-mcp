@@ -20,7 +20,13 @@ CALDAV_USERNAME=your-username
 CALDAV_PASSWORD=your-app-password
 ```
 
-Then load it before running tests:
+Then run tests using Makefile (recommended):
+
+```bash
+make test-e2e
+```
+
+Or manually:
 
 ```bash
 set -a
@@ -34,6 +40,8 @@ uv run pytest tests/e2e/ -v
 Run all e2e tests:
 
 ```bash
+make test-e2e
+# or
 uv run pytest tests/e2e/ -v -m e2e
 ```
 
