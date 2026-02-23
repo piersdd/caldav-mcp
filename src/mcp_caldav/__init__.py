@@ -1,6 +1,5 @@
 """MCP CalDAV Server - Calendar integration for MCP."""
 
-import asyncio
 import logging
 import os
 
@@ -88,10 +87,9 @@ def main(
     if caldav_password:
         os.environ["CALDAV_PASSWORD"] = caldav_password
 
-    from . import server
+    from .server import mcp
 
-    # Run the server with specified transport
-    asyncio.run(server.run_server(transport=transport, port=port))
+    mcp.run(transport=transport)
 
 
 __all__ = ["__version__", "main", "server"]
