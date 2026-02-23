@@ -1,4 +1,4 @@
-.PHONY: help install install-dev sync test test-unit test-e2e test-cov lint format type-check check clean run server coverage coverage-html pre-commit-install pre-commit-run
+.PHONY: help install install-dev sync test test-unit test-e2e test-e2e-providers test-cov lint format type-check check clean run server coverage coverage-html pre-commit-install pre-commit-run
 
 # Default target
 help:
@@ -9,6 +9,7 @@ help:
 	@echo "  make test             - Run all unit tests (excluding e2e)"
 	@echo "  make test-unit        - Run unit tests only"
 	@echo "  make test-e2e         - Run e2e tests (loads vars from .env.e2e)"
+	@echo "  make test-e2e-providers - Run Fastmail/iCloud E2E tests (loads vars from tests/e2e/.env.e2e.providers)"
 	@echo "  make test-cov         - Run tests with coverage report"
 	@echo "  make coverage         - Generate coverage report (terminal)"
 	@echo "  make coverage-html    - Generate HTML coverage report"
@@ -48,6 +49,15 @@ test-e2e:
 		echo "Error: E2E tests require CALDAV_URL, CALDAV_USERNAME, and CALDAV_PASSWORD in .env.e2e"; \
 		exit 1; \
 	fi && uv run pytest tests/e2e/ -v -m e2e'
+
+test-e2e-providers:
+	@if [ ! -f tests/e2e/.env.e2e.providers ]; then \
+		echo "Error: tests/e2e/.env.e2e.providers not found."; \
+		echo "Copy tests/e2e/.env.e2e.providers.example and fill in credentials."; \
+		exit 1; \
+	fi
+	@zsh -c 'set -a && source tests/e2e/.env.e2e.providers && set +a && \
+		uv run pytest tests/e2e/test_providers_e2e.py -v'
 
 test-cov:
 	uv run pytest tests/ -m "not e2e" --cov=src/mcp_caldav --cov-report=term-missing --cov-report=html -v

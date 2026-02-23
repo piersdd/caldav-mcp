@@ -1,885 +1,480 @@
-"""CalDAV client for calendar operations."""
+"""CalDAV client wrapper.
 
-from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, TypedDict
+Wraps the python-caldav library with a clean interface for the MCP server.
+This module is intentionally kept free of MCP concerns.
+"""
 
-if TYPE_CHECKING:
-    import caldav
+from __future__ import annotations
 
-try:
-    import caldav
-except ImportError as err:
-    raise ImportError(
-        "caldav library is not installed. Install it with: pip install caldav"
-    ) from err
+import json
+import logging
+from datetime import date, datetime, timezone
+from typing import Any
 
+import caldav
+from caldav import DAVClient
+from icalendar import Calendar, vDatetime, vText
+from icalendar import Event as iCalEvent
 
-class CalendarInfo(TypedDict):
-    index: int
-    name: str
-    url: str
-
-
-class EventAttendee(TypedDict, total=False):
-    email: str
-    status: str
-    name: str
+logger = logging.getLogger(__name__)
 
 
-class EventRecord(TypedDict, total=False):
-    uid: str
-    title: str
-    start: str
-    end: str
-    description: str
-    location: str
-    all_day: bool
-    categories: list[str]
-    priority: int | None
-    recurrence: str | None
-    attendees: list[EventAttendee]
-
-
-class EventCreationResult(TypedDict):
-    success: bool
-    uid: str
-    title: str
-    start_time: str
-    end_time: str
-    calendar: str
-
-
-class EventDeletionResult(TypedDict):
-    success: bool
-    uid: str
-    message: str
-
-
-AttendeeInput = EventAttendee | str
-
-
-def _escape_ical_text(value: str | Any) -> str:
-    """Escape text for inclusion in iCalendar payloads."""
-    if not isinstance(value, str):
-        value = str(value)
-    result: str = (
-        value.replace("\\", "\\\\")
-        .replace("\n", "\\n")
-        .replace(",", "\\,")
-        .replace(";", "\\;")
-    )
-    return result
-
-
-def _format_rrule(recurrence: dict) -> str:
-    """
-    Format recurrence rule (RRULE) from dictionary to iCalendar RRULE string.
-
-    Args:
-        recurrence: Dictionary with keys:
-            - frequency: 'DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'
-            - interval: int (optional, default 1)
-            - count: int (optional, number of occurrences)
-            - until: datetime or date (optional, end date)
-            - byday: str (optional, e.g., 'MO,WE,FR' for Monday, Wednesday, Friday)
-            - bymonthday: int (optional, day of month)
-            - bymonth: int (optional, month 1-12)
-
-    Returns:
-        RRULE string for iCalendar
-    """
-    if not recurrence:
-        return ""
-
-    frequency = recurrence.get("frequency", "DAILY").upper()
-    if frequency not in ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"]:
-        raise ValueError(f"Invalid frequency: {frequency}")
-
-    parts = [f"FREQ={frequency}"]
-
-    interval = recurrence.get("interval", 1)
-    if interval > 1:
-        parts.append(f"INTERVAL={interval}")
-
-    count = recurrence.get("count")
-    if count:
-        parts.append(f"COUNT={count}")
-
-    until = recurrence.get("until")
-    if until:
-        if isinstance(until, datetime):
-            until_str = until.strftime("%Y%m%dT%H%M%SZ")
-        elif isinstance(until, date):
-            until_str = until.strftime("%Y%m%d")
-        else:
-            until_str = str(until)
-        parts.append(f"UNTIL={until_str}")
-
-    byday = recurrence.get("byday")
-    if byday:
-        parts.append(f"BYDAY={byday}")
-
-    bymonthday = recurrence.get("bymonthday")
-    if bymonthday:
-        parts.append(f"BYMONTHDAY={bymonthday}")
-
-    bymonth = recurrence.get("bymonth")
-    if bymonth:
-        parts.append(f"BYMONTH={bymonth}")
-
-    return f"RRULE:{';'.join(parts)}"
-
-
-def _format_categories(categories: list[str]) -> str:
-    """
-    Format categories list to iCalendar CATEGORIES string.
-
-    Args:
-        categories: List of category strings
-
-    Returns:
-        CATEGORIES line for iCalendar
-    """
-    if not categories:
-        return ""
-    # Escape commas in categories and join with commas
-    escaped = [cat.replace(",", "\\,").replace(";", "\\;") for cat in categories]
-    return f"CATEGORIES:{','.join(escaped)}"
-
-
-def _format_attendees(attendees: list[AttendeeInput]) -> str:
-    """
-    Format attendees to iCalendar ATTENDEE lines.
-
-    Args:
-        attendees: List of email strings or dicts with 'email' and optional 'status'
-            Status can be: 'ACCEPTED', 'DECLINED', 'TENTATIVE', 'NEEDS-ACTION'
-
-    Returns:
-        ATTENDEE lines for iCalendar
-    """
-    if not attendees:
-        return ""
-
-    attendee_lines = []
-    for attendee in attendees:
-        display_name = ""
-        if isinstance(attendee, str):
-            email = attendee.strip()
-            status = None
-        elif isinstance(attendee, dict):
-            email = attendee.get("email", "").strip()
-            status = attendee.get("status", "").upper()
-            display_name = attendee.get("name", email)
-        else:
-            # Skip invalid attendee types (should not happen with proper typing)
-            continue  # type: ignore[unreachable]
-
-        if "@" not in email:
+def _parse_datetime(value: str) -> datetime:
+    """Parse an ISO 8601 datetime string, returning a timezone-aware datetime."""
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
             continue
-
-        # Build ATTENDEE line
-        cn_value = _escape_ical_text(display_name or email)
-        params = ["RSVP=TRUE", f"CN={cn_value}"]
-        if status and status in ["ACCEPTED", "DECLINED", "TENTATIVE", "NEEDS-ACTION"]:
-            params.append(f"PARTSTAT={status}")
-
-        attendee_line = f"ATTENDEE;{';'.join(params)}:mailto:{email}"
-        attendee_lines.append(attendee_line)
-
-    return "\n".join(attendee_lines) + "\n" if attendee_lines else ""
+    raise ValueError(f"Cannot parse datetime string: {value!r}")
 
 
-def _parse_categories(cats: Any) -> list[str]:
-    """
-    Parse categories from iCalendar component.
-
-    Args:
-        cats: CATEGORIES value from iCalendar component
-
-    Returns:
-        List of category strings
-    """
-    if not cats:
-        return []
-
-    categories = []
-    try:
-        # Handle vText objects or lists
-        if hasattr(cats, "cats"):
-            # Multiple categories as list
-            for cat in cats.cats:
-                if hasattr(cat, "value"):
-                    categories.append(str(cat.value))
-                else:
-                    categories.append(str(cat))
-        elif hasattr(cats, "value"):
-            # Single category as vText
-            value = cats.value
-            if isinstance(value, bytes):
-                value = value.decode("utf-8")
-            categories = [c.strip() for c in str(value).split(",")]
-        elif isinstance(cats, list):
-            # List of category objects
-            for cat in cats:
-                if hasattr(cat, "value"):
-                    val = cat.value
-                    if isinstance(val, bytes):
-                        val = val.decode("utf-8")
-                    categories.append(str(val))
-                else:
-                    categories.append(str(cat))
-        else:
-            # String format
-            cat_str = str(cats)
-            if isinstance(cats, bytes):
-                cat_str = cats.decode("utf-8")
-            categories = [c.strip() for c in cat_str.split(",")]
-    except Exception:
-        # Fallback: try to convert to string
-        try:
-            categories = [str(cats)]
-        except Exception:
-            categories = []
-
-    return [c for c in categories if c]
+def _serialize_dt(dt: date | datetime | None) -> str | None:
+    """Serialize a date or datetime to ISO 8601 string."""
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    return dt.isoformat()
 
 
-def _parse_attendees(ical_component: Any) -> list[EventAttendee]:
-    """
-    Parse attendees from iCalendar component.
+def _extract_event(vevent: Any) -> dict[str, Any]:
+    """Extract a VEVENT component into a plain dict."""
+    attendees = []
+    raw_attendees = vevent.get("ATTENDEE", [])
+    if not isinstance(raw_attendees, list):
+        raw_attendees = [raw_attendees]
+    for att in raw_attendees:
+        partstat = att.params.get("PARTSTAT", "NEEDS-ACTION") if hasattr(att, "params") else "NEEDS-ACTION"
+        cn = att.params.get("CN", str(att)) if hasattr(att, "params") else str(att)
+        attendees.append({"email": str(att).replace("mailto:", ""), "name": cn, "status": partstat})
 
-    Args:
-        ical_component: iCalendar component object
-
-    Returns:
-        List of attendee dictionaries with 'email' and 'status'
-    """
-    attendees: list[EventAttendee] = []
-    attendee_list = ical_component.get("ATTENDEE", [])
-    if not isinstance(attendee_list, list):
-        attendee_list = [attendee_list]
-
-    for attendee in attendee_list:
-        try:
-            if hasattr(attendee, "params"):
-                email = str(attendee).replace("mailto:", "")
-                status = (
-                    attendee.params.get("PARTSTAT", ["NEEDS-ACTION"])[0]
-                    if hasattr(attendee, "params")
-                    else "NEEDS-ACTION"
-                )
-                attendees.append({"email": email, "status": status})
+    categories: list[str] = []
+    raw_cats = vevent.get("CATEGORIES", [])
+    if raw_cats:
+        if not isinstance(raw_cats, list):
+            raw_cats = [raw_cats]
+        for cat in raw_cats:
+            if hasattr(cat, "cats"):
+                categories.extend(str(c) for c in cat.cats)
             else:
-                # Fallback for string format
-                email = str(attendee).replace("mailto:", "").strip()
-                if email:
-                    attendees.append({"email": email, "status": "NEEDS-ACTION"})
-        except Exception:
-            continue
+                categories.append(str(cat))
 
-    return attendees
+    rrule = None
+    if "RRULE" in vevent:
+        rrule = vevent["RRULE"].to_ical().decode()
+
+    alarms: list[dict[str, Any]] = []
+    for component in vevent.subcomponents:
+        if component.name == "VALARM":
+            trigger = component.get("TRIGGER")
+            alarms.append({"trigger": str(trigger) if trigger else None})
+
+    return {
+        "uid": str(vevent.get("UID", "")),
+        "title": str(vevent.get("SUMMARY", "")),
+        "description": str(vevent.get("DESCRIPTION", "")) if vevent.get("DESCRIPTION") else None,
+        "location": str(vevent.get("LOCATION", "")) if vevent.get("LOCATION") else None,
+        "start": _serialize_dt(vevent.get("DTSTART", {}).dt if vevent.get("DTSTART") else None),
+        "end": _serialize_dt(vevent.get("DTEND", {}).dt if vevent.get("DTEND") else None),
+        "recurrence_rule": rrule,
+        "categories": categories,
+        "priority": int(str(vevent.get("PRIORITY", 0))) if vevent.get("PRIORITY") else 0,
+        "attendees": attendees,
+        "alarms": alarms,
+        "sequence": int(str(vevent.get("SEQUENCE", 0))) if vevent.get("SEQUENCE") else 0,
+    }
 
 
 class CalDAVClient:
-    """
-    Client for working with CalDAV calendars.
+    """Thread-safe wrapper around python-caldav for use by the MCP server."""
 
-    Note: Some CalDAV providers (like Yandex Calendar) have rate limiting.
-    Yandex Calendar artificially slows down WebDAV operations (60 seconds per MB since 2021),
-    which can cause frequent 504 timeouts, especially when creating/updating events.
-    """
+    def __init__(self, url: str, username: str, password: str) -> None:
+        self._url = url
+        self._username = username
+        self._password = password
+        self._dav: DAVClient | None = None
+        self._principal: Any = None
 
-    def __init__(
-        self,
-        url: str,
-        username: str,
-        password: str,
-    ):
+    def _connect(self) -> None:
+        if self._dav is None:
+            self._dav = DAVClient(url=self._url, username=self._username, password=self._password)
+            self._principal = self._dav.principal()
+
+    def _get_calendar_by_uid(self, calendar_uid: str) -> Any:
+        self._connect()
+        for cal in self._principal.calendars():
+            if str(cal.id) == calendar_uid or (cal.name and str(cal.name) == calendar_uid):
+                return cal
+        raise ValueError(f"Calendar not found: {calendar_uid!r}")
+
+    def _find_event_by_uid(self, event_uid: str, calendar_uid: str | None = None) -> tuple[Any, Any]:
+        """Return (calendar, event) for the given event UID.
+
+        If calendar_uid is given, only that calendar is searched; otherwise all
+        calendars are searched in order.
         """
-        Initialize CalDAV client.
+        self._connect()
+        calendars = (
+            [self._get_calendar_by_uid(calendar_uid)]
+            if calendar_uid
+            else self._principal.calendars()
+        )
+        for cal in calendars:
+            try:
+                event = cal.object_by_uid(event_uid)
+                return cal, event
+            except caldav.error.NotFoundError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Error searching calendar %s for UID %s: %s", cal.name, event_uid, exc)
+                continue
+        raise ValueError(f"Event with UID {event_uid!r} not found")
 
-        Args:
-            url: CalDAV server URL (e.g., "https://caldav.example.com/")
-            username: Username for authentication
-            password: Password or app password for authentication
-        """
-        self.url = url
-        self.username = username
-        self.password = password
-        self.client: Any | None = None
-        self.principal: Any | None = None
-        # Detect Yandex Calendar for special handling
-        self.is_yandex = "yandex.ru" in url.lower() or "yandex.com" in url.lower()
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def connect(self) -> bool:
-        """Connect to CalDAV server."""
-        try:
-            self.client = caldav.DAVClient(
-                url=self.url,
-                username=self.username,
-                password=self.password,
-            )
-            self.principal = self.client.principal()
-            return True
-        except Exception as e:
-            raise ConnectionError(f"Failed to connect to CalDAV server: {e}") from e
-
-    def list_calendars(self) -> list[CalendarInfo]:
-        """Get list of available calendars."""
-        if not self.principal:
-            raise RuntimeError("Not connected to CalDAV server. Call connect() first.")
-
-        try:
-            calendars = self.principal.calendars()
-            return [
-                CalendarInfo(index=i, name=cal.name, url=str(cal.url))
-                for i, cal in enumerate(calendars)
-            ]
-        except Exception as e:
-            raise RuntimeError(f"Failed to list calendars: {e}") from e
+    def list_calendars(self) -> list[dict[str, Any]]:
+        """Return a list of all accessible calendars."""
+        self._connect()
+        result = []
+        for cal in self._principal.calendars():
+            result.append({
+                "uid": str(cal.id),
+                "name": str(cal.name) if cal.name else None,
+                "url": str(cal.url),
+            })
+        return result
 
     def create_event(
         self,
-        calendar_index: int = 0,
-        title: str = "Event",
-        description: str = "",
-        location: str = "",
-        start_time: datetime | None = None,
-        end_time: datetime | None = None,
-        duration_hours: float = 1.0,
-        reminders: list[dict] | None = None,
-        attendees: list[AttendeeInput] | None = None,
+        calendar_uid: str,
+        title: str,
+        start: str,
+        end: str,
+        description: str | None = None,
+        location: str | None = None,
+        recurrence_rule: str | None = None,
         categories: list[str] | None = None,
-        priority: int | None = None,
-        recurrence: dict | None = None,
-    ) -> EventCreationResult:
-        """
-        Create an event in the calendar.
+        priority: int = 0,
+        attendees: list[dict[str, str]] | None = None,
+        alarm_minutes: int | None = None,
+    ) -> dict[str, Any]:
+        """Create a new event and return its serialized form."""
+        cal = self._get_calendar_by_uid(calendar_uid)
 
-        Args:
-            calendar_index: Calendar index (default: 0)
-            title: Event title
-            description: Event description
-            location: Event location
-            start_time: Start time (default: tomorrow at 14:00)
-            end_time: End time (optional, uses duration_hours if not provided)
-            duration_hours: Duration in hours (used if end_time not provided)
-            reminders: List of reminder dictionaries with keys:
-                - minutes_before: minutes before event
-                - action: 'DISPLAY', 'EMAIL', or 'AUDIO'
-                - description: reminder text (optional)
-            attendees: List of email addresses (str) or dicts with 'email' and 'status'
-                Status can be: 'ACCEPTED', 'DECLINED', 'TENTATIVE', 'NEEDS-ACTION'
-            categories: List of category strings
-            priority: Priority 0-9 (0 = highest, 9 = lowest)
-            recurrence: Dictionary with recurrence rules:
-                - frequency: 'DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'
-                - interval: int (optional, default 1)
-                - count: int (optional, number of occurrences)
-                - until: datetime/date (optional, end date)
-                - byday: str (optional, e.g., 'MO,WE,FR')
-                - bymonthday: int (optional)
-                - bymonth: int (optional)
+        dtstart = _parse_datetime(start)
+        dtend = _parse_datetime(end)
 
-        Returns:
-            Event creation metadata
-        """
-        if not self.principal:
-            raise RuntimeError("Not connected to CalDAV server. Call connect() first.")
+        kwargs: dict[str, Any] = {
+            "dtstart": dtstart,
+            "dtend": dtend,
+            "summary": title,
+        }
+        if description:
+            kwargs["description"] = description
+        if location:
+            kwargs["location"] = location
 
-        try:
-            calendars = self.principal.calendars()
-            if calendar_index >= len(calendars):
-                raise ValueError(
-                    f"Calendar index {calendar_index} not found. "
-                    f"Available calendars: {len(calendars)}"
-                )
+        event = cal.save_event(**kwargs)
 
-            calendar = calendars[calendar_index]
+        # Apply fields not supported by save_event kwargs directly
+        with event.edit_icalendar_instance() as ical:
+            for comp in ical.subcomponents:
+                if comp.name != "VEVENT":
+                    continue
+                if recurrence_rule:
+                    from icalendar import vRecur
+                    comp["RRULE"] = vRecur.from_ical(recurrence_rule)
+                if categories:
+                    from icalendar import vCategory
+                    comp["CATEGORIES"] = categories
+                if priority:
+                    comp["PRIORITY"] = priority
+                if attendees:
+                    for att in attendees:
+                        from icalendar import vCalAddress
+                        a = vCalAddress(f"mailto:{att['email']}")
+                        a.params["CN"] = att.get("name", att["email"])
+                        a.params["PARTSTAT"] = att.get("status", "NEEDS-ACTION")
+                        comp.add("ATTENDEE", a)
+                if alarm_minutes is not None:
+                    from datetime import timedelta
+                    from icalendar import Alarm
+                    alarm = Alarm()
+                    alarm.add("action", "DISPLAY")
+                    alarm.add("trigger", timedelta(minutes=-alarm_minutes))
+                    comp.add_component(alarm)
 
-            # Set default times
-            if start_time is None:
-                start_time = datetime.now() + timedelta(days=1)
-                start_time = start_time.replace(
-                    hour=14, minute=0, second=0, microsecond=0
-                )
-            if end_time is None:
-                end_time = start_time + timedelta(hours=duration_hours)
-
-            # Generate unique UID
-            uid = f"{int(datetime.now().timestamp())}@caldav-mcp"
-
-            title_escaped = _escape_ical_text(title)
-            description_escaped = _escape_ical_text(description)
-            location_escaped = _escape_ical_text(location)
-
-            # Format alarm components for reminders
-            alarm_components = ""
-            if reminders:
-                for reminder in reminders:
-                    minutes_before = reminder.get("minutes_before", 15)
-                    action = reminder.get("action", "DISPLAY").upper()
-                    description_text = _escape_ical_text(
-                        reminder.get("description", title)
-                    )
-
-                    if action == "DISPLAY":
-                        alarm_components += f"""BEGIN:VALARM
-ACTION:DISPLAY
-TRIGGER:-PT{minutes_before}M
-DESCRIPTION:{description_text}
-END:VALARM
-"""
-                    elif action == "EMAIL":
-                        email_to = reminder.get("email_to", "")
-                        alarm_components += f"""BEGIN:VALARM
-ACTION:EMAIL
-TRIGGER:-PT{minutes_before}M
-SUMMARY:{title_escaped}
-DESCRIPTION:{description_text}
-"""
-                        if email_to:
-                            alarm_components += f"ATTENDEE:mailto:{email_to}\n"
-                        alarm_components += "END:VALARM\n"
-                    elif action == "AUDIO":
-                        alarm_components += f"""BEGIN:VALARM
-ACTION:AUDIO
-TRIGGER:-PT{minutes_before}M
-DESCRIPTION:{description_text}
-END:VALARM
-"""
-
-            # Format attendee components
-            attendee_components = _format_attendees(attendees) if attendees else ""
-
-            # Format categories
-            categories_line = _format_categories(categories) if categories else ""
-            if categories_line:
-                categories_line += "\n"
-
-            # Format priority
-            priority_line = f"PRIORITY:{priority}\n" if priority is not None else ""
-
-            # Format recurrence
-            rrule_line = _format_rrule(recurrence) + "\n" if recurrence else ""
-
-            # Format iCalendar data
-            vcal_data = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//CalDAV MCP Server//Python//EN
-CALSCALE:GREGORIAN
-BEGIN:VEVENT
-UID:{uid}
-DTSTAMP:{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}
-DTSTART:{start_time.strftime("%Y%m%dT%H%M%S")}
-DTEND:{end_time.strftime("%Y%m%dT%H%M%S")}
-SUMMARY:{title_escaped}
-DESCRIPTION:{description_escaped}
-LOCATION:{location_escaped}
-STATUS:CONFIRMED
-SEQUENCE:0
-{priority_line}{categories_line}{rrule_line}{attendee_components}{alarm_components}END:VEVENT
-END:VCALENDAR"""
-
-            # Save event
-            calendar.save_event(vcal_data)
-
-            return {
-                "success": True,
-                "uid": uid,
-                "title": title,
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-                "calendar": calendar.name,
-            }
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to create event: {e}") from e
+        # Re-fetch to return fully populated data
+        _, refreshed = self._find_event_by_uid(
+            str(event.icalendar_instance.subcomponents[0].get("UID", "")),
+            calendar_uid,
+        )
+        ical_instance = refreshed.icalendar_instance
+        for comp in ical_instance.subcomponents:
+            if comp.name == "VEVENT":
+                return _extract_event(comp)
+        return {}
 
     def get_events(
         self,
-        calendar_index: int = 0,
-        start_date: datetime | None = None,
-        end_date: datetime | None = None,
-        include_all_day: bool = True,
-    ) -> list[EventRecord]:
-        """
-        Get events from calendar for specified period.
+        calendar_uid: str,
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        """Return events in the given date range from the specified calendar."""
+        cal = self._get_calendar_by_uid(calendar_uid)
+        dtstart = _parse_datetime(start)
+        dtend = _parse_datetime(end)
 
-        Args:
-            calendar_index: Calendar index (default: 0)
-            start_date: Start of period (default: today 00:00)
-            end_date: End of period (default: 7 days from start_date)
-            include_all_day: Include all-day events
+        results = cal.search(start=dtstart, end=dtend, event=True, expand=True)
+        events = []
+        for obj in results:
+            for comp in obj.icalendar_instance.subcomponents:
+                if comp.name == "VEVENT":
+                    events.append(_extract_event(comp))
+        return events
 
-        Returns:
-            List of event dictionaries
-        """
-        if not self.principal:
-            raise RuntimeError("Not connected to CalDAV server. Call connect() first.")
+    def get_today_events(self, calendar_uid: str | None = None) -> list[dict[str, Any]]:
+        """Return all events for today across all calendars (or one calendar)."""
+        now = datetime.now(tz=timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+        self._connect()
+        calendars = (
+            [self._get_calendar_by_uid(calendar_uid)]
+            if calendar_uid
+            else self._principal.calendars()
+        )
+        events: list[dict[str, Any]] = []
+        for cal in calendars:
+            try:
+                results = cal.search(start=today_start, end=today_end, event=True, expand=True)
+                for obj in results:
+                    for comp in obj.icalendar_instance.subcomponents:
+                        if comp.name == "VEVENT":
+                            events.append(_extract_event(comp))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to get today events for calendar %s: %s", cal.name, exc)
+        return events
 
-        try:
-            calendars = self.principal.calendars()
-            if calendar_index >= len(calendars):
-                raise ValueError(
-                    f"Calendar index {calendar_index} not found. "
-                    f"Available calendars: {len(calendars)}"
-                )
-
-            calendar = calendars[calendar_index]
-
-            # Set default dates
-            if start_date is None:
-                start_date = datetime.now().replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-            if end_date is None:
-                end_date = start_date + timedelta(days=7)
-
-            # Search for events
-            events = calendar.date_search(start=start_date, end=end_date)
-
-            result: list[EventRecord] = []
-            for event in events:
-                try:
-                    ical_component = event.icalendar_component
-
-                    summary = ical_component.get("SUMMARY")
-                    title = str(summary) if summary else ""
-
-                    desc = ical_component.get("DESCRIPTION")
-                    description = str(desc) if desc else ""
-
-                    loc = ical_component.get("LOCATION")
-                    location = str(loc) if loc else ""
-
-                    dtstart = ical_component.get("DTSTART")
-                    dtend = ical_component.get("DTEND")
-
-                    if dtstart:
-                        start_dt = dtstart.dt
-                        if isinstance(start_dt, date) and not isinstance(
-                            start_dt, datetime
-                        ):
-                            start_dt = datetime.combine(start_dt, datetime.min.time())
-                            all_day = True
-                        else:
-                            all_day = False
-                    else:
-                        continue
-
-                    if dtend:
-                        end_dt = dtend.dt
-                        if isinstance(end_dt, date) and not isinstance(
-                            end_dt, datetime
-                        ):
-                            end_dt = datetime.combine(end_dt, datetime.max.time())
-                    else:
-                        end_dt = start_dt + timedelta(hours=1)
-
-                    if not include_all_day and all_day:
-                        continue
-
-                    # Extract UID
-                    uid = str(ical_component.get("UID", ""))
-
-                    # Extract categories
-                    cats = ical_component.get("CATEGORIES")
-                    categories = _parse_categories(cats)
-
-                    # Extract priority
-                    priority = ical_component.get("PRIORITY")
-                    priority_value = int(priority) if priority is not None else None
-
-                    # Extract recurrence rule
-                    rrule = ical_component.get("RRULE")
-                    recurrence = str(rrule) if rrule else None
-
-                    # Extract attendees
-                    attendees = _parse_attendees(ical_component)
-
-                    result.append(
-                        {
-                            "uid": uid,
-                            "title": title,
-                            "start": start_dt.isoformat(),
-                            "end": end_dt.isoformat(),
-                            "description": description,
-                            "location": location,
-                            "all_day": all_day,
-                            "categories": categories,
-                            "priority": priority_value,
-                            "recurrence": recurrence,
-                            "attendees": attendees,
-                        }
-                    )
-
-                except Exception:
-                    # Skip events that can't be processed
-                    continue
-
-            # Sort by start time
-            result.sort(key=lambda x: x["start"])
-
-            return result
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to get events: {e}") from e
-
-    def get_today_events(self, calendar_index: int = 0) -> list[EventRecord]:
-        """Get all events for today."""
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end = today_start + timedelta(days=1)
-        return self.get_events(calendar_index, today_start, today_end)
-
-    def get_week_events(
-        self, calendar_index: int = 0, start_from_today: bool = True
-    ) -> list[EventRecord]:
-        """Get all events for the week."""
-        if start_from_today:
-            start_date = datetime.now().replace(
+    def get_week_events(self, calendar_uid: str | None = None, start_monday: bool = False) -> list[dict[str, Any]]:
+        """Return events for the current week."""
+        from datetime import timedelta
+        now = datetime.now(tz=timezone.utc)
+        if start_monday:
+            days_since_monday = now.weekday()
+            week_start = (now - timedelta(days=days_since_monday)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
         else:
-            today = datetime.now()
-            days_since_monday = today.weekday()
-            start_date = (today - timedelta(days=days_since_monday)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
+            week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_end = week_start + timedelta(days=7)
+        self._connect()
+        calendars = (
+            [self._get_calendar_by_uid(calendar_uid)]
+            if calendar_uid
+            else self._principal.calendars()
+        )
+        events: list[dict[str, Any]] = []
+        for cal in calendars:
+            try:
+                results = cal.search(start=week_start, end=week_end, event=True, expand=True)
+                for obj in results:
+                    for comp in obj.icalendar_instance.subcomponents:
+                        if comp.name == "VEVENT":
+                            events.append(_extract_event(comp))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to get week events for calendar %s: %s", cal.name, exc)
+        return events
 
-        end_date = start_date + timedelta(days=7)
-        return self.get_events(calendar_index, start_date, end_date)
+    def get_event_by_uid(self, event_uid: str, calendar_uid: str | None = None) -> dict[str, Any]:
+        """Return a single event by UID."""
+        _, event = self._find_event_by_uid(event_uid, calendar_uid)
+        for comp in event.icalendar_instance.subcomponents:
+            if comp.name == "VEVENT":
+                return _extract_event(comp)
+        raise ValueError(f"VEVENT component not found in object {event_uid!r}")
 
-    def get_event_by_uid(self, uid: str, calendar_index: int = 0) -> EventRecord | None:
-        """
-        Get a specific event by its UID.
-
-        Args:
-            uid: Event UID
-            calendar_index: Calendar index (default: 0)
-
-        Returns:
-            Event dictionary or None if not found
-        """
-        if not self.principal:
-            raise RuntimeError("Not connected to CalDAV server. Call connect() first.")
-
-        try:
-            calendars = self.principal.calendars()
-            if calendar_index >= len(calendars):
-                raise ValueError(
-                    f"Calendar index {calendar_index} not found. "
-                    f"Available calendars: {len(calendars)}"
-                )
-
-            calendar = calendars[calendar_index]
-
-            # Search for event by UID
-            # Try to search in a wide date range (last year to next year)
-            start_date = datetime.now() - timedelta(days=365)
-            end_date = datetime.now() + timedelta(days=365)
-            events = calendar.date_search(start=start_date, end=end_date)
-
-            for event in events:
-                try:
-                    ical_component = event.icalendar_component
-                    event_uid = str(ical_component.get("UID", ""))
-                    if event_uid == uid:
-                        # Parse event similar to get_events
-                        summary = ical_component.get("SUMMARY")
-                        title = str(summary) if summary else ""
-
-                        desc = ical_component.get("DESCRIPTION")
-                        description = str(desc) if desc else ""
-
-                        loc = ical_component.get("LOCATION")
-                        location = str(loc) if loc else ""
-
-                        dtstart = ical_component.get("DTSTART")
-                        dtend = ical_component.get("DTEND")
-
-                        if dtstart:
-                            start_dt = dtstart.dt
-                            if isinstance(start_dt, date) and not isinstance(
-                                start_dt, datetime
-                            ):
-                                start_dt = datetime.combine(
-                                    start_dt, datetime.min.time()
-                                )
-                                all_day = True
-                            else:
-                                all_day = False
-                        else:
-                            continue
-
-                        if dtend:
-                            end_dt = dtend.dt
-                            if isinstance(end_dt, date) and not isinstance(
-                                end_dt, datetime
-                            ):
-                                end_dt = datetime.combine(end_dt, datetime.max.time())
-                        else:
-                            end_dt = start_dt + timedelta(hours=1)
-
-                        # Extract additional fields
-                        cats = ical_component.get("CATEGORIES")
-                        categories = _parse_categories(cats)
-
-                        priority = ical_component.get("PRIORITY")
-                        priority_value = int(priority) if priority is not None else None
-
-                        rrule = ical_component.get("RRULE")
-                        recurrence = str(rrule) if rrule else None
-
-                        attendees = _parse_attendees(ical_component)
-
-                        return {
-                            "uid": uid,
-                            "title": title,
-                            "start": start_dt.isoformat(),
-                            "end": end_dt.isoformat(),
-                            "description": description,
-                            "location": location,
-                            "all_day": all_day,
-                            "categories": categories,
-                            "priority": priority_value,
-                            "recurrence": recurrence,
-                            "attendees": attendees,
-                        }
-                except Exception:
-                    continue
-
-            return None
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to get event by UID: {e}") from e
-
-    def delete_event(self, uid: str, calendar_index: int = 0) -> EventDeletionResult:
-        """
-        Delete an event by its UID.
-
-        Args:
-            uid: Event UID to delete
-            calendar_index: Calendar index (default: 0)
-
-        Returns:
-            Dictionary with deletion result
-        """
-        if not self.principal:
-            raise RuntimeError("Not connected to CalDAV server. Call connect() first.")
-
-        try:
-            calendars = self.principal.calendars()
-            if calendar_index >= len(calendars):
-                raise ValueError(
-                    f"Calendar index {calendar_index} not found. "
-                    f"Available calendars: {len(calendars)}"
-                )
-
-            calendar = calendars[calendar_index]
-
-            # Find the event
-            start_date = datetime.now() - timedelta(days=365)
-            end_date = datetime.now() + timedelta(days=365)
-            events = calendar.date_search(start=start_date, end=end_date)
-
-            for event in events:
-                try:
-                    ical_component = event.icalendar_component
-                    event_uid = str(ical_component.get("UID", ""))
-                    if event_uid == uid:
-                        event.delete()
-                        return {
-                            "success": True,
-                            "uid": uid,
-                            "message": "Event deleted successfully",
-                        }
-                except Exception:
-                    continue
-
-            raise ValueError(f"Event with UID {uid} not found")
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to delete event: {e}") from e
+    def delete_event(self, event_uid: str, calendar_uid: str | None = None) -> bool:
+        """Delete an event by UID. Returns True if deleted."""
+        _, event = self._find_event_by_uid(event_uid, calendar_uid)
+        event.delete()
+        return True
 
     def search_events(
         self,
-        calendar_index: int = 0,
         query: str | None = None,
-        search_fields: list[str] | None = None,
-        start_date: datetime | None = None,
-        end_date: datetime | None = None,
-    ) -> list[EventRecord]:
-        """
-        Search events by text, attendees, or location.
+        attendee: str | None = None,
+        location: str | None = None,
+        calendar_uid: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search events by text, attendee email, or location."""
+        self._connect()
+        calendars = (
+            [self._get_calendar_by_uid(calendar_uid)]
+            if calendar_uid
+            else self._principal.calendars()
+        )
+        dtstart = _parse_datetime(start) if start else None
+        dtend = _parse_datetime(end) if end else None
+        results: list[dict[str, Any]] = []
+
+        for cal in calendars:
+            try:
+                objs = cal.search(
+                    start=dtstart,
+                    end=dtend,
+                    event=True,
+                    expand=True,
+                )
+                for obj in objs:
+                    for comp in obj.icalendar_instance.subcomponents:
+                        if comp.name != "VEVENT":
+                            continue
+                        ev = _extract_event(comp)
+                        # Client-side filtering (server search support varies)
+                        if query:
+                            q = query.lower()
+                            text = " ".join(filter(None, [ev.get("title"), ev.get("description")])).lower()
+                            if q not in text:
+                                continue
+                        if attendee:
+                            emails = [a["email"].lower() for a in ev.get("attendees", [])]
+                            if attendee.lower() not in emails:
+                                continue
+                        if location:
+                            if location.lower() not in (ev.get("location") or "").lower():
+                                continue
+                        results.append(ev)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to search calendar %s: %s", cal.name, exc)
+        return results
+
+    def update_event(
+        self,
+        event_uid: str,
+        calendar_uid: str | None = None,
+        title: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        recurrence_rule: str | None = None,
+        categories: list[str] | None = None,
+        priority: int | None = None,
+    ) -> dict[str, Any]:
+        """Partially update an existing event.
+
+        Only the fields provided (non-None) will be changed.  The SEQUENCE
+        counter is incremented automatically as required by RFC 5545 §3.8.7.4
+        so that CalDAV servers and connected clients can detect the change.
 
         Args:
-            calendar_index: Calendar index (default: 0)
-            query: Search query string
-            search_fields: Fields to search in: 'title', 'description', 'location', 'attendees'
-                If None, searches in all fields
-            start_date: Start of search period (inclusive)
-            end_date: End of search period (exclusive)
+            event_uid: UID of the event to update.
+            calendar_uid: Calendar name or UID to search within (optional;
+                          searches all calendars when omitted).
+            title: New summary/title.
+            start: New start datetime (ISO 8601 string).
+            end: New end datetime (ISO 8601 string).
+            description: New description (pass empty string to clear).
+            location: New location (pass empty string to clear).
+            recurrence_rule: New RRULE string, e.g. "FREQ=WEEKLY;BYDAY=MO".
+            categories: Replacement category list.
+            priority: New priority value (0–9, 0 = undefined / highest).
 
         Returns:
-            List of matching event dictionaries
+            The updated event as a dict (same shape as get_event_by_uid).
+
+        Raises:
+            ValueError: If the event cannot be found.
         """
-        if not self.principal:
-            raise RuntimeError("Not connected to CalDAV server. Call connect() first.")
+        if all(v is None for v in (title, start, end, description, location, recurrence_rule, categories, priority)):
+            # Nothing to do - return current state
+            return self.get_event_by_uid(event_uid, calendar_uid)
 
-        if start_date is None or end_date is None:
-            raise ValueError(
-                "Both start_date and end_date must be provided for search."
-            )
+        _, event = self._find_event_by_uid(event_uid, calendar_uid)
 
-        try:
-            # Get events in date range
+        with event.edit_icalendar_instance() as ical:
+            for comp in ical.subcomponents:
+                if comp.name != "VEVENT":
+                    continue
 
-            all_events = self.get_events(
-                calendar_index=calendar_index,
-                start_date=start_date,
-                end_date=end_date,
-            )
+                if title is not None:
+                    comp["SUMMARY"] = vText(title)
 
-            if not query:
-                return all_events
+                if start is not None:
+                    dtstart = _parse_datetime(start)
+                    if "DTSTART" in comp:
+                        del comp["DTSTART"]
+                    comp.add("DTSTART", dtstart)
 
-            query_lower = query.lower()
-            if search_fields is None:
-                search_fields = ["title", "description", "location", "attendees"]
+                if end is not None:
+                    dtend = _parse_datetime(end)
+                    if "DTEND" in comp:
+                        del comp["DTEND"]
+                    comp.add("DTEND", dtend)
 
-            results: list[EventRecord] = []
-            for event in all_events:
-                match = False
+                if description is not None:
+                    if "DESCRIPTION" in comp:
+                        del comp["DESCRIPTION"]
+                    if description:  # empty string = clear field
+                        comp["DESCRIPTION"] = vText(description)
 
-                if (
-                    (
-                        "title" in search_fields
-                        and query_lower in event.get("title", "").lower()
-                    )
-                    or (
-                        "description" in search_fields
-                        and query_lower in event.get("description", "").lower()
-                    )
-                    or (
-                        "location" in search_fields
-                        and query_lower in event.get("location", "").lower()
-                    )
-                ):
-                    match = True
-                elif "attendees" in search_fields:
-                    attendees = event.get("attendees") or []
-                    for attendee in attendees:
-                        email = attendee.get("email", "").lower()
-                        if query_lower in email:
-                            match = True
-                            break
+                if location is not None:
+                    if "LOCATION" in comp:
+                        del comp["LOCATION"]
+                    if location:
+                        comp["LOCATION"] = vText(location)
 
-                if match:
-                    results.append(event)
+                if recurrence_rule is not None:
+                    if "RRULE" in comp:
+                        del comp["RRULE"]
+                    if recurrence_rule:
+                        from icalendar import vRecur
+                        comp["RRULE"] = vRecur.from_ical(recurrence_rule)
 
-            return results
+                if categories is not None:
+                    if "CATEGORIES" in comp:
+                        del comp["CATEGORIES"]
+                    if categories:
+                        comp.add("CATEGORIES", categories)
 
-        except Exception as e:
-            raise RuntimeError(f"Failed to search events: {e}") from e
+                if priority is not None:
+                    comp["PRIORITY"] = priority
+
+                # RFC 5545 §3.8.7.4: increment SEQUENCE on every update
+                current_seq = int(str(comp.get("SEQUENCE", 0)))
+                if "SEQUENCE" in comp:
+                    del comp["SEQUENCE"]
+                comp.add("SEQUENCE", current_seq + 1)
+
+                # Update modification timestamps
+                now = datetime.now(tz=timezone.utc)
+                for field in ("LAST-MODIFIED", "DTSTAMP"):
+                    if field in comp:
+                        del comp[field]
+                comp.add("LAST-MODIFIED", now)
+                comp.add("DTSTAMP", now)
+
+        # Re-fetch to return the server's canonical representation
+        _, refreshed = self._find_event_by_uid(event_uid, calendar_uid)
+        for comp in refreshed.icalendar_instance.subcomponents:
+            if comp.name == "VEVENT":
+                return _extract_event(comp)
+        raise ValueError(f"VEVENT component missing after update for UID {event_uid!r}")
